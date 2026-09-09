@@ -16,7 +16,6 @@ from homeassistant.helpers import config_validation as cv
 from ..const import (
     DATA_PUSH_SUBSCRIPTIONS,
     DOMAIN,
-    PUSH_SUBSCRIPTION_DATA,
     PUSH_SUBSCRIPTION_ENTITY_IDS,
     PUSH_SUBSCRIPTION_KIND,
     PUSH_SUBSCRIPTION_KIND_REMOTE_MEDIA,
@@ -53,6 +52,14 @@ from .const import (
     WEBHOOK_TYPE_TOKEN,
 )
 from .mapper import MEDIA_PLAYER_PREFIX
+from .model import RemoteMediaFollowCursor
+from .store import (
+    async_follows,
+    async_load_follow_cursor,
+    async_retire_follows,
+    async_save_follow_cursor,
+    follow_context,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -162,34 +169,54 @@ async def webhook_remote_media_session_token(
         )
         return empty_okay_response()
 
-    previous = _remote_subscription(hass, webhook_id, session_id)
-    previous_context: dict[str, Any] = (
-        previous.get(PUSH_SUBSCRIPTION_DATA, {}) if previous is not None else {}
-    )
-    previous_sequence = previous_context.get(CONTEXT_GENERATION_SEQUENCE)
-
-    if isinstance(previous_sequence, int):
-        if sequence < previous_sequence:
+    cursor = async_load_follow_cursor(hass, webhook_id)
+    if cursor is not None:
+        if sequence < cursor.generation_sequence:
+            # A registration from a relationship the user has already replaced, arriving late.
+            # Nothing about it is applied: not the token, not the entity, not the sticky state,
+            # not the ordering clock, and no listener is moved.
             _LOGGER.debug(
                 "Ignoring a stale Remote Now Playing registration for session %s: it names"
                 " Follow %s, and %s is current",
                 session_id,
                 sequence,
-                previous_sequence,
+                cursor.generation_sequence,
             )
             return empty_okay_response()
-        if (
-            sequence == previous_sequence
-            and previous_context.get(CONTEXT_GENERATION) != generation
-        ):
-            _LOGGER.warning(
-                "Ignoring a conflicting Remote Now Playing registration for %s: Follow %s is"
-                " already held by a different session lifetime",
-                entity_id,
-                sequence,
-            )
-            return empty_okay_response()
+        if sequence == cursor.generation_sequence:
+            if cursor.generation != generation:
+                # Two relationships claiming one place in the order. The app increments the
+                # counter once per relationship, so this should be impossible; guessing which is
+                # newer would be exactly the heuristic the sequence exists to avoid.
+                _LOGGER.warning(
+                    "Ignoring a conflicting Remote Now Playing registration for %s: Follow %s is"
+                    " already held by a different session lifetime",
+                    entity_id,
+                    sequence,
+                )
+                return empty_okay_response()
+            if cursor.ended:
+                # The user stopped following this relationship, and this registration was queued
+                # before they did. Honouring it would put back the card they dismissed.
+                _LOGGER.debug(
+                    "Ignoring a registration for the ended Remote Now Playing Follow %s/%s",
+                    generation,
+                    sequence,
+                )
+                return empty_okay_response()
 
+    # The registration is authoritative, so every other Follow this registration still holds
+    # describes a relationship the phone has moved on from. Spare this session id: when it is the
+    # same relationship, its published state is still what the card is showing.
+    async_retire_follows(hass, webhook_id, keep=session_id)
+    async_save_follow_cursor(
+        hass, webhook_id, RemoteMediaFollowCursor(generation, sequence, False)
+    )
+
+    previous = _remote_subscription(hass, webhook_id, session_id)
+    previous_context: dict[str, Any] = (
+        follow_context(previous) if previous is not None else {}
+    )
     same_lifetime = _describes_same_lifetime(previous_context, generation, sequence)
     if (
         previous is not None
@@ -250,21 +277,51 @@ async def webhook_remote_media_session_token(
 async def webhook_remote_media_session_dismissed(
     hass: HomeAssistant, config_entry: ConfigEntry, data: dict[str, Any]
 ) -> Response:
-    """Remove the generic subscription only for the current Follow lifetime."""
+    """Stop the Follow relationship this dismissal names, and remember that it ended."""
     webhook_id = config_entry.data[CONF_WEBHOOK_ID]
     session_id = data[ATTR_SESSION_ID]
-    if (subscription := _remote_subscription(hass, webhook_id, session_id)) is None:
-        return empty_okay_response()
+    generation = data[ATTR_GENERATION]
+    sequence = data[ATTR_GENERATION_SEQUENCE]
 
-    context = subscription.get(PUSH_SUBSCRIPTION_DATA, {})
-    if not _describes_same_lifetime(
-        context, data[ATTR_GENERATION], data[ATTR_GENERATION_SEQUENCE]
-    ):
-        return empty_okay_response()
+    cursor = async_load_follow_cursor(hass, webhook_id)
+    if cursor is not None:
+        if sequence < cursor.generation_sequence:
+            # Stopping and immediately following again reuses the session identifier, so acting on
+            # this would take the newer relationship's token with it.
+            _LOGGER.debug(
+                "Ignoring a stale Remote Now Playing dismissal for session %s: it names Follow"
+                " %s/%s, and %s is current",
+                session_id,
+                generation,
+                sequence,
+                cursor.generation_sequence,
+            )
+            return empty_okay_response()
+        if sequence == cursor.generation_sequence and cursor.generation != generation:
+            _LOGGER.warning(
+                "Ignoring a conflicting Remote Now Playing dismissal for Follow %s: it is held by"
+                " a different session lifetime",
+                sequence,
+            )
+            return empty_okay_response()
 
-    remove_push_subscription(hass, webhook_id, session_id)
-    _LOGGER.debug(
-        "Stopped following %s for Remote Now Playing",
-        subscription[PUSH_SUBSCRIPTION_ENTITY_IDS][0],
+    # Recorded before anything is removed, so a registration for this relationship that is still
+    # in flight cannot bring it back - including one Core never saw a registration for at all.
+    async_save_follow_cursor(
+        hass, webhook_id, RemoteMediaFollowCursor(generation, sequence, True)
     )
+
+    # A dismissal newer than the cursor ends everything: the phone has moved past every
+    # relationship Core knows about, whichever session identifiers those carried. One at the
+    # cursor ends only the relationship it names.
+    ends_everything = cursor is None or sequence > cursor.generation_sequence
+    for follow_id, subscription in async_follows(hass, webhook_id):
+        if ends_everything or _describes_same_lifetime(
+            follow_context(subscription), generation, sequence
+        ):
+            remove_push_subscription(hass, webhook_id, follow_id)
+            _LOGGER.debug(
+                "Stopped following %s for Remote Now Playing",
+                subscription[PUSH_SUBSCRIPTION_ENTITY_IDS][0],
+            )
     return empty_okay_response()

@@ -8,7 +8,7 @@ DOMAIN = "mobile_app"
 
 STORAGE_KEY = DOMAIN
 STORAGE_VERSION = 1
-STORAGE_VERSION_MINOR = 3
+STORAGE_VERSION_MINOR = 4
 STORAGE_SAVE_DELAY_SECONDS = 10
 
 CONF_CLOUDHOOK_URL = "cloudhook_url"
@@ -23,6 +23,10 @@ DATA_DEVICES = "devices"
 DATA_LIVE_ACTIVITY_TOKENS = "live_activity_tokens"
 DATA_LIVE_ACTIVITY_CLEANUP_CANCEL = "live_activity_cleanup_cancel"
 DATA_PUSH_SUBSCRIPTIONS = "push_subscriptions"
+# Opaque per-device state owned by one subscription kind, keyed
+# [webhook_id][kind]. Persisted, and outlives the subscriptions themselves so
+# a kind can remember an ordering decision after its last one is removed.
+DATA_PUSH_SUBSCRIPTION_DEVICE_DATA = "push_subscription_device_data"
 DATA_PUSH_SUBSCRIPTION_UNSUBS = "push_subscription_unsubs"
 DATA_PUSH_SUBSCRIPTION_DEBOUNCE = "push_subscription_debounce"
 DATA_STORE = "store"

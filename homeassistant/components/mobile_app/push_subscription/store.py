@@ -8,10 +8,20 @@ State changes are debounced per subscription: a burst of rapid changes within
 PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS collapses to a single push (trailing edge),
 so a chatty entity does not exhaust the device's background-push budget.
 
+A subscription follows the entity, not the string that names it: renaming a
+tracked entity in the entity registry rewrites the stored entity_ids and pushes,
+so the app learns the new identifier rather than silently going quiet.
+
 Three runtime structures, all keyed [webhook_id][sub_id]:
 - DATA_PUSH_SUBSCRIPTIONS: persisted token/entities/target mapping.
-- DATA_PUSH_SUBSCRIPTION_UNSUBS: state-change listener cancels (runtime only).
+- DATA_PUSH_SUBSCRIPTION_UNSUBS: listener cancels, one per subscription, covering
+  both its state-change and its entity-registry listener (runtime only).
 - DATA_PUSH_SUBSCRIPTION_DEBOUNCE: pending debounce-timer cancels (runtime only).
+
+A fourth, DATA_PUSH_SUBSCRIPTION_DEVICE_DATA, is keyed [webhook_id][kind] and
+holds opaque state a delivery kind keeps for a whole device. It is persisted and
+is not tied to any one subscription, so a kind can remember a decision after its
+last subscription is gone; it is dropped only when the entry is removed.
 
 Two lifecycle paths:
 - async_teardown_device_subscriptions: on unload/reload, cancel listeners and
@@ -26,7 +36,12 @@ from functools import partial
 import logging
 
 from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
-from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.entity_registry import EventEntityRegistryUpdatedData
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_entity_registry_updated_event,
+    async_track_state_change_event,
+)
 from homeassistant.helpers.start import async_at_started
 
 from ..const import (
@@ -34,6 +49,7 @@ from ..const import (
     ATTR_PUSH_URL,
     DATA_CONFIG_ENTRIES,
     DATA_PUSH_SUBSCRIPTION_DEBOUNCE,
+    DATA_PUSH_SUBSCRIPTION_DEVICE_DATA,
     DATA_PUSH_SUBSCRIPTION_UNSUBS,
     DATA_PUSH_SUBSCRIPTIONS,
     DATA_STORE,
@@ -119,15 +135,17 @@ def _async_unsub_tracker(hass: HomeAssistant, webhook_id: str, sub_id: str) -> N
 def _async_setup_tracker(
     hass: HomeAssistant, webhook_id: str, sub_id: str, entity_ids: Iterable[str]
 ) -> None:
-    """Start (or restart) the state-change listener for one subscription."""
+    """Start (or restart) the listeners for one subscription."""
     # Replace any existing listener so an updated entity set takes effect.
     _async_unsub_tracker(hass, webhook_id, sub_id)
 
-    # Only arm a listener for registrations that can send a cloud push; others
+    # Only arm listeners for registrations that can send a cloud push; others
     # would schedule a debounce timer on every state change that never sends.
     entry = hass.data[DOMAIN][DATA_CONFIG_ENTRIES].get(webhook_id)
     if entry is None or ATTR_PUSH_URL not in entry.data.get(ATTR_APP_DATA, {}):
         return
+
+    tracked = list(entity_ids)
 
     @callback
     def _handle_state_change(event: Event[EventStateChangedData]) -> None:
@@ -139,10 +157,79 @@ def _async_setup_tracker(
             return
         async_schedule_subscription_push(hass, webhook_id, sub_id)
 
-    unsub = async_track_state_change_event(hass, list(entity_ids), _handle_state_change)
+    @callback
+    def _handle_registry_update(event: Event[EventEntityRegistryUpdatedData]) -> None:
+        # Only a rename is acted on. A state going to None is transient - an
+        # integration reload removes and restores its entities - and a registry
+        # removal is left alone, because what a surface with no entity should do
+        # is the app's decision and it can always remove the subscription.
+        data = event.data
+        if data["action"] != "update":
+            return
+        if (old_entity_id := data.get("old_entity_id")) is None:
+            return
+        _async_follow_rename(hass, webhook_id, sub_id, old_entity_id, data["entity_id"])
+
+    unsub_state = async_track_state_change_event(hass, tracked, _handle_state_change)
+    unsub_registry = async_track_entity_registry_updated_event(
+        hass, tracked, _handle_registry_update
+    )
+
+    @callback
+    def _unsub() -> None:
+        unsub_state()
+        unsub_registry()
+
     hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS].setdefault(webhook_id, {})[
         sub_id
-    ] = unsub
+    ] = _unsub
+
+
+@callback
+def _async_follow_rename(
+    hass: HomeAssistant,
+    webhook_id: str,
+    sub_id: str,
+    old_entity_id: str,
+    new_entity_id: str,
+) -> None:
+    """Move one subscription onto an entity's new identifier.
+
+    The subscription is with the entity, so nothing else about it changes: not
+    the push token, not the delivery kind, and not the opaque context - which is
+    how a Remote Now Playing Follow keeps its Apple session id and its place in
+    the ordering across a rename. The push that follows is what tells the app
+    which identifier to ask about from now on.
+    """
+    subscription = (
+        hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS].get(webhook_id, {}).get(sub_id)
+    )
+    if subscription is None:
+        return
+    entity_ids: list[str] = subscription[PUSH_SUBSCRIPTION_ENTITY_IDS]
+    if old_entity_id not in entity_ids:
+        return
+
+    _LOGGER.debug(
+        "%s was renamed to %s; moving push subscription %s onto it",
+        old_entity_id,
+        new_entity_id,
+        sub_id,
+    )
+    # dict.fromkeys collapses the case where the new name is already tracked, so
+    # a rename cannot arm the same entity's listener twice.
+    updated = list(
+        dict.fromkeys(
+            new_entity_id if entity_id == old_entity_id else entity_id
+            for entity_id in entity_ids
+        )
+    )
+    subscription[PUSH_SUBSCRIPTION_ENTITY_IDS] = updated
+    _async_setup_tracker(hass, webhook_id, sub_id, updated)
+    hass.data[DOMAIN][DATA_STORE].async_delay_save(
+        partial(savable_state, hass), STORAGE_SAVE_DELAY_SECONDS
+    )
+    async_schedule_subscription_push(hass, webhook_id, sub_id)
 
 
 @callback
@@ -215,6 +302,29 @@ def update_push_subscription_data(
 
 
 @callback
+def get_device_subscription_data(
+    hass: HomeAssistant, webhook_id: str, kind: str
+) -> dict[str, object] | None:
+    """Return one delivery kind's opaque device-wide state, if it has any."""
+    data = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_DEVICE_DATA].get(webhook_id, {})
+    stored = data.get(kind)
+    return stored if isinstance(stored, dict) else None
+
+
+@callback
+def set_device_subscription_data(
+    hass: HomeAssistant, webhook_id: str, kind: str, data: dict[str, object]
+) -> None:
+    """Persist one delivery kind's opaque device-wide state."""
+    hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_DEVICE_DATA].setdefault(webhook_id, {})[
+        kind
+    ] = data
+    hass.data[DOMAIN][DATA_STORE].async_delay_save(
+        partial(savable_state, hass), STORAGE_SAVE_DELAY_SECONDS
+    )
+
+
+@callback
 def remove_push_subscription(hass: HomeAssistant, webhook_id: str, sub_id: str) -> None:
     """Remove one stored subscription and cancel its listener + timer."""
     subscriptions = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS]
@@ -253,8 +363,14 @@ def async_teardown_device_subscriptions(hass: HomeAssistant, webhook_id: str) ->
 
 @callback
 def remove_stored_device_subscriptions(hass: HomeAssistant, webhook_id: str) -> None:
-    """Drop all subscriptions for a device on entry removal."""
+    """Drop all subscriptions, and each kind's device state, on entry removal.
+
+    Unlike a restart or a reload, the registration itself is gone: there is
+    nothing left for a kind's remembered ordering to be about, and keeping it
+    would decide the fate of a re-registration that has nothing to do with it.
+    """
     hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS].pop(webhook_id, None)
+    hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_DEVICE_DATA].pop(webhook_id, None)
     async_teardown_device_subscriptions(hass, webhook_id)
 
 

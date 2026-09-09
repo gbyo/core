@@ -29,6 +29,7 @@ from homeassistant.components.mobile_app.push_subscription.notify import (
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_WEBHOOK_ID
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
 
 from .const import REGISTER_CLEARTEXT, UPDATE
@@ -492,3 +493,72 @@ async def test_send_push_swallows_client_error(
         await _send_subscription_push(hass, entry, SUB_ID, sub)
 
     assert session.post.call_count == 1
+
+
+async def test_a_rename_moves_a_subscription_onto_the_new_entity_id(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    push_webhook_id: str,
+    entity_registry: er.EntityRegistry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A subscription is with the entity, not with the string that names it.
+
+    Renaming one in the entity registry would otherwise leave the subscription listening for an
+    identifier nothing will ever report again, with no way for the app to find out.
+    """
+    entry = entity_registry.async_get_or_create(
+        "light", "test", "lamp-1", suggested_object_id="living_room"
+    )
+    assert entry.entity_id == TRACKED_ENTITY
+    await _register_subscription(
+        webhook_client, push_webhook_id, entity_ids=[TRACKED_ENTITY, "light.hall"]
+    )
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        entity_registry.async_update_entity(
+            TRACKED_ENTITY, new_entity_id="light.lounge"
+        )
+        await hass.async_block_till_done()
+        freezer.tick(timedelta(seconds=PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    stored = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID]
+    assert stored[PUSH_SUBSCRIPTION_ENTITY_IDS] == ["light.lounge", "light.hall"]
+    assert stored[PUSH_SUBSCRIPTION_TOKEN] == SUB_TOKEN
+    assert stored[PUSH_SUBSCRIPTION_TARGET] == "lock_screen"
+    # One listener entry for the subscription, and the rename is worth telling the app about.
+    assert len(hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][push_webhook_id]) == 1
+    assert mock_send.call_count == 1
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        hass.states.async_set("light.lounge", "on")
+        await hass.async_block_till_done()
+        freezer.tick(timedelta(seconds=PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert mock_send.call_count == 1
+
+
+async def test_a_rename_onto_an_already_tracked_entity_id_does_not_duplicate_it(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    push_webhook_id: str,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Two tracked entities collapsing into one must not arm the same listener twice."""
+    entry = entity_registry.async_get_or_create(
+        "light", "test", "lamp-1", suggested_object_id="living_room"
+    )
+    assert entry.entity_id == TRACKED_ENTITY
+    await _register_subscription(
+        webhook_client, push_webhook_id, entity_ids=[TRACKED_ENTITY, "light.hall"]
+    )
+
+    entity_registry.async_update_entity(TRACKED_ENTITY, new_entity_id="light.hall")
+    await hass.async_block_till_done()
+
+    stored = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID]
+    assert stored[PUSH_SUBSCRIPTION_ENTITY_IDS] == ["light.hall"]

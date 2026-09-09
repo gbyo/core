@@ -52,6 +52,7 @@ from .const import (
     DATA_PENDING_UPDATES,
     DATA_PUSH_CHANNEL,
     DATA_PUSH_SUBSCRIPTION_DEBOUNCE,
+    DATA_PUSH_SUBSCRIPTION_DEVICE_DATA,
     DATA_PUSH_SUBSCRIPTION_UNSUBS,
     DATA_PUSH_SUBSCRIPTIONS,
     DATA_STORE,
@@ -95,6 +96,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             DATA_DELETED_IDS: [],
             DATA_LIVE_ACTIVITY_TOKENS: {},
             DATA_PUSH_SUBSCRIPTIONS: {},
+            DATA_PUSH_SUBSCRIPTION_DEVICE_DATA: {},
         }
 
     hass.data[DOMAIN] = {
@@ -104,6 +106,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         DATA_LIVE_ACTIVITY_TOKENS: app_config[DATA_LIVE_ACTIVITY_TOKENS],
         DATA_LIVE_ACTIVITY_CLEANUP_CANCEL: None,
         DATA_PUSH_SUBSCRIPTIONS: app_config.get(DATA_PUSH_SUBSCRIPTIONS, {}),
+        DATA_PUSH_SUBSCRIPTION_DEVICE_DATA: app_config.get(
+            DATA_PUSH_SUBSCRIPTION_DEVICE_DATA, {}
+        ),
         DATA_PUSH_SUBSCRIPTION_UNSUBS: {},
         DATA_PUSH_SUBSCRIPTION_DEBOUNCE: {},
         DATA_PUSH_CHANNEL: {},
@@ -299,4 +304,9 @@ class _MobileAppStore(Store[dict[str, Any]]):
             old_data.setdefault(DATA_LIVE_ACTIVITY_TOKENS, {})
         if old_major_version == 1 and old_minor_version < 3:
             old_data.setdefault(DATA_PUSH_SUBSCRIPTIONS, {})
+        if old_major_version == 1 and old_minor_version < 4:
+            # Each kind derives its own state from the subscriptions it already
+            # owns the first time it is asked for it, so there is nothing to
+            # compute here — see `remote_media.cursor.async_load_follow_cursor`.
+            old_data.setdefault(DATA_PUSH_SUBSCRIPTION_DEVICE_DATA, {})
         return old_data

@@ -10,15 +10,20 @@ from typing import Any, Self
 from homeassistant.const import ATTR_STATE
 
 from .const import (
+    ARTWORK_DISPOSITION_ABSENT,
+    ARTWORK_DISPOSITION_AVAILABLE,
     ATTR_ALBUM,
     ATTR_ARTIST,
     ATTR_ARTWORK,
+    ATTR_ARTWORK_DISPOSITION,
     ATTR_ARTWORK_URL,
     ATTR_CONTENT_ID,
     ATTR_DEVICE_CLASS,
     ATTR_DEVICE_NAME,
     ATTR_DURATION,
     ATTR_FEATURES,
+    ATTR_GENERATION,
+    ATTR_GENERATION_SEQUENCE,
     ATTR_IS_MUTED,
     ATTR_POSITION,
     ATTR_POSITION_UPDATED_AT_UNIX,
@@ -27,6 +32,7 @@ from .const import (
     ATTR_TITLE,
     ATTR_VOLUME,
     ATTR_WIRE_ENTITY_ID,
+    CURSOR_ENDED,
 )
 
 # Playback states the iOS `RemoteMediaPlaybackState` collapses to "not reporting". Anything the
@@ -119,10 +125,11 @@ class RemoteMediaSnapshot:
     def as_wire(self) -> dict[str, Any]:
         """Return the snapshot as the iOS decoder expects it.
 
-        `selection`, `deviceName`, `state` and `features` are always present because Swift decodes
-        them unconditionally; everything else is omitted when absent, which keeps the payload inside
-        the relay's 4096-byte ceiling. `artwork` carries a credential-free source and never a token:
-        see `mapper._public_artwork`.
+        `selection`, `deviceName`, `state`, `features` and `artworkDisposition` are always present
+        because Swift decodes them unconditionally, or defaults them to something Core does not
+        mean; everything else is omitted when absent, which keeps the payload inside the relay's
+        4096-byte ceiling. `artwork` carries a credential-free source and never a token: see
+        `mapper._public_artwork`.
         """
         wire: dict[str, Any] = {
             ATTR_SELECTION: {
@@ -150,6 +157,11 @@ class RemoteMediaSnapshot:
         )
         if self.artwork_url is not None:
             wire[ATTR_ARTWORK] = {ATTR_ARTWORK_URL: self.artwork_url}
+            wire[ATTR_ARTWORK_DISPOSITION] = ARTWORK_DISPOSITION_AVAILABLE
+        else:
+            # Never `deferred`: Core is not preparing an image and never will be, so an omission
+            # here would be read as "wait for one" and keep the previous track's cover.
+            wire[ATTR_ARTWORK_DISPOSITION] = ARTWORK_DISPOSITION_ABSENT
         return wire
 
     def as_storage(self) -> dict[str, Any]:
@@ -197,3 +209,44 @@ class RemoteMediaSnapshot:
             )
         except KeyError, TypeError:
             return None
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteMediaFollowCursor:
+    """The newest Follow relationship one mobile_app registration has claimed.
+
+    One per registration, not one per Apple session id. The app counts Follow relationships for
+    itself, so this is what places a late webhook in the order the phone actually meant, whichever
+    session identifier it happens to carry.
+    """
+
+    generation: str
+    generation_sequence: int
+    ended: bool
+
+    def as_storage(self) -> dict[str, Any]:
+        """Return the cursor as persisted."""
+        return {
+            ATTR_GENERATION: self.generation,
+            ATTR_GENERATION_SEQUENCE: self.generation_sequence,
+            CURSOR_ENDED: self.ended,
+        }
+
+    @classmethod
+    def from_storage(cls, data: dict[str, Any]) -> Self | None:
+        """Rebuild a persisted cursor, or return None when it cannot be trusted.
+
+        A malformed cursor is discarded rather than repaired: guessing an ordering value is exactly
+        the heuristic the sequence exists to avoid.
+        """
+        generation = data.get(ATTR_GENERATION)
+        sequence = data.get(ATTR_GENERATION_SEQUENCE)
+        ended = data.get(CURSOR_ENDED)
+        if (
+            not isinstance(generation, str)
+            or not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or not isinstance(ended, bool)
+        ):
+            return None
+        return cls(generation, sequence, ended)

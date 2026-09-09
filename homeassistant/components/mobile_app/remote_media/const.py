@@ -67,11 +67,20 @@ ATTR_DURATION = "duration"
 ATTR_POSITION = "position"
 ATTR_POSITION_UPDATED_AT_UNIX = "positionUpdatedAtUnix"
 ATTR_ARTWORK = "artwork"
+ATTR_ARTWORK_DISPOSITION = "artworkDisposition"
 # The key inside `artwork`. Matches Swift `RemoteMediaArtworkDescriptor.CodingKeys.url`.
 ATTR_ARTWORK_URL = "url"
 ATTR_VOLUME = "volume"
 ATTR_IS_MUTED = "isMuted"
 ATTR_FEATURES = "features"
+
+# The two `RemoteMediaArtworkDisposition` cases Core can honestly report. The third, `deferred`,
+# belongs to the host app alone: it means an image is still being prepared, which only a running
+# app can be doing. Saying it explicitly is what makes an absent image clear the card - the iOS
+# decoder defaults a snapshot with no `artwork` to `deferred`, and its reducer then keeps the
+# previous artwork for the same track, so silence here would leave the last cover on screen.
+ARTWORK_DISPOSITION_AVAILABLE = "available"
+ARTWORK_DISPOSITION_ABSENT = "absent"
 
 # How long several state events are allowed to settle into one push. Integrations emit sequences
 # like `playing A` -> `idle` (blank) -> `playing B` within milliseconds, and the card should learn
@@ -96,3 +105,14 @@ CONTEXT_SERVER_ID = ATTR_SERVER_ID_KEY
 CONTEXT_SCHEMA_VERSION = ATTR_SCHEMA_VERSION
 CONTEXT_LAST_TIMESTAMP = "last_timestamp"
 CONTEXT_LAST_SNAPSHOT = "last_snapshot"
+
+# The Follow ordering cursor, persisted as one registration's opaque RemoteMedia device state.
+# Its scope is the registration and not the Apple session id, because the app increments the
+# sequence once per Follow relationship across the whole app, and a phone that stops following one
+# player and follows another reuses neither identifier reliably.
+CURSOR_GENERATION = ATTR_GENERATION
+CURSOR_GENERATION_SEQUENCE = ATTR_GENERATION_SEQUENCE
+# Whether the newest relationship the cursor names has already been stopped. Kept rather than
+# forgotten so a registration that arrives after its own dismissal - the app retries a webhook it
+# queued before the user stopped following - cannot bring the card back.
+CURSOR_ENDED = "ended"

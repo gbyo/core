@@ -45,6 +45,9 @@ async def test_wire_keys_are_the_swift_coding_keys(hass: HomeAssistant) -> None:
         "positionUpdatedAtUnix": 1788739200.0,
         "volume": 0.4,
         "isMuted": False,
+        # This fixture's `entity_picture` is a signed proxy path, so there is no artwork Core may
+        # send - and saying so is not the same as saying nothing. See `TestArtwork`.
+        "artworkDisposition": "absent",
     }
 
 
@@ -67,7 +70,7 @@ async def test_required_fields_are_always_present(hass: HomeAssistant) -> None:
             )
         ),
     ).as_wire()
-    for key in ("selection", "deviceName", "state", "features"):
+    for key in ("selection", "deviceName", "state", "features", "artworkDisposition"):
         assert key in wire, key
     assert wire["selection"] == {"serverId": "home", "entityId": ENTITY_ID}
 
@@ -256,6 +259,7 @@ class TestArtwork:
         snapshot = snapshot_from_state(hass.states.get(ENTITY_ID), SERVER_ID)
         assert snapshot.artwork_url == picture
         assert snapshot.as_wire()["artwork"] == {"url": picture}
+        assert snapshot.as_wire()["artworkDisposition"] == "available"
 
     @pytest.mark.parametrize(
         ("label", "picture"),
@@ -290,6 +294,10 @@ class TestArtwork:
         snapshot = snapshot_from_state(hass.states.get(ENTITY_ID), SERVER_ID)
         assert snapshot.artwork_url is None, label
         assert "artwork" not in snapshot.as_wire(), label
+        # Withheld is `absent`, never a missing key: the iOS decoder reads a snapshot with no
+        # `artwork` and no disposition as `deferred`, which asks the card to keep showing the
+        # cover it already has.
+        assert snapshot.as_wire()["artworkDisposition"] == "absent", label
 
     def test_the_default_fixture_carries_no_artwork(self, hass: HomeAssistant) -> None:
         """`PLAYING_ATTRIBUTES` uses the signed proxy form, which must never cross."""
