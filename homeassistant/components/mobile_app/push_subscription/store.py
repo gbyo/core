@@ -27,6 +27,7 @@ import logging
 
 from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.start import async_at_started
 
 from ..const import (
     ATTR_APP_DATA,
@@ -42,6 +43,7 @@ from ..const import (
     PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS,
     PUSH_SUBSCRIPTION_ENTITY_IDS,
     PUSH_SUBSCRIPTION_KIND,
+    PUSH_SUBSCRIPTION_KIND_REMOTE_MEDIA,
     PUSH_SUBSCRIPTION_MAX_PER_DEVICE,
     PUSH_SUBSCRIPTION_TARGET,
     PUSH_SUBSCRIPTION_TOKEN,
@@ -263,10 +265,25 @@ def async_restore_push_subscriptions(hass: HomeAssistant, webhook_id: str) -> No
     Called from async_setup_entry once the entry is in DATA_CONFIG_ENTRIES, so a
     subscription survives a Home Assistant restart without the app re-registering.
     """
-    if webhook_id not in hass.data[DOMAIN][DATA_CONFIG_ENTRIES]:
+    if (entry := hass.data[DOMAIN][DATA_CONFIG_ENTRIES].get(webhook_id)) is None:
         return
     device_subs = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS].get(webhook_id, {})
     for sub_id, sub in device_subs.items():
         _async_setup_tracker(
             hass, webhook_id, sub_id, sub[PUSH_SUBSCRIPTION_ENTITY_IDS]
         )
+        if sub.get(
+            PUSH_SUBSCRIPTION_KIND
+        ) == PUSH_SUBSCRIPTION_KIND_REMOTE_MEDIA and ATTR_PUSH_URL in entry.data.get(
+            ATTR_APP_DATA, {}
+        ):
+            entry.async_on_unload(
+                async_at_started(
+                    hass,
+                    partial(
+                        async_schedule_subscription_push,
+                        webhook_id=webhook_id,
+                        sub_id=sub_id,
+                    ),
+                )
+            )

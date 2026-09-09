@@ -31,7 +31,7 @@ from homeassistant.const import CONF_WEBHOOK_ID
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
-from .const import REGISTER_CLEARTEXT
+from .const import REGISTER_CLEARTEXT, UPDATE
 
 from tests.common import async_fire_time_changed
 
@@ -151,6 +151,45 @@ async def test_no_listener_without_push_url(
     # registration can never send a push.
     assert SUB_ID in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][webhook_id]
     assert webhook_id not in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS]
+
+
+async def test_update_registration_arms_stored_subscription_without_duplicates(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Gaining push capability arms one listener for an existing subscription."""
+    await async_setup_component(hass, DOMAIN, {DOMAIN: {}})
+    response = await webhook_client.post(
+        "/api/mobile_app/registrations", json=REGISTER_CLEARTEXT
+    )
+    assert response.status == HTTPStatus.CREATED
+    webhook_id = (await response.json())[CONF_WEBHOOK_ID]
+    await hass.async_block_till_done()
+    await _register_subscription(webhook_client, webhook_id)
+    assert webhook_id not in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS]
+    freezer.move_to("2026-01-01 00:00:00+00:00")
+
+    update = {
+        **UPDATE,
+        "app_data": {"push_url": PUSH_URL, "push_token": "device-token"},
+    }
+    for _ in range(2):
+        response = await webhook_client.post(
+            f"/api/webhook/{webhook_id}",
+            json={"type": "update_registration", "data": update},
+        )
+        assert response.status == HTTPStatus.OK
+        assert len(hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][webhook_id]) == 1
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        hass.states.async_set(TRACKED_ENTITY, "on")
+        await hass.async_block_till_done()
+        freezer.tick(timedelta(seconds=PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert mock_send.call_count == 1
 
 
 async def test_register_is_idempotent(

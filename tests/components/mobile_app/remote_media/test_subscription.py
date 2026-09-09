@@ -1,9 +1,11 @@
 """Remote Now Playing on top of generic mobile_app push subscriptions."""
 
+import asyncio
 from datetime import timedelta
 from http import HTTPStatus
 import logging
 from typing import Any
+from unittest.mock import patch
 
 from aiohttp.test_utils import TestClient
 import pytest
@@ -34,6 +36,10 @@ from homeassistant.components.mobile_app.remote_media.const import (
     CONTEXT_LAST_TIMESTAMP,
     CONTEXT_SCHEMA_VERSION,
     CONTEXT_SERVER_ID,
+)
+from homeassistant.components.mobile_app.remote_media.push import PushOutcome
+from homeassistant.components.mobile_app.remote_media.subscription import (
+    async_deliver_subscription,
 )
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
@@ -67,6 +73,9 @@ NEXT_TRACK = {
     "media_position": 0,
     "media_position_updated_at": "2026-09-07T00:04:00+00:00",
 }
+SEND_REMOTE_MEDIA = (
+    "homeassistant.components.mobile_app.remote_media.subscription.async_send"
+)
 
 
 async def _post(
@@ -105,6 +114,51 @@ def _subscription(hass: HomeAssistant, webhook_id: str) -> dict[str, Any]:
 def _payloads(mock: AiohttpClientMocker) -> list[dict[str, Any]]:
     """Return JSON bodies sent to the push relay."""
     return [call[2] for call in mock.mock_calls]
+
+
+async def _deliver_current_state(hass: HomeAssistant, webhook_id: str) -> None:
+    """Deliver the current entity state through the RemoteMedia adapter."""
+    await async_deliver_subscription(
+        hass,
+        hass.data[DOMAIN][DATA_CONFIG_ENTRIES][webhook_id],
+        webhook_id,
+        SESSION_ID,
+        _subscription(hass, webhook_id),
+    )
+
+
+async def _run_overlapping_deliveries(
+    hass: HomeAssistant,
+    webhook_id: str,
+    second_outcome: PushOutcome,
+) -> list[int]:
+    """Complete a newer delivery before releasing an older one."""
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    timestamps: list[int] = []
+
+    async def controlled_send(*args: Any) -> PushOutcome:
+        timestamps.append(args[5])
+        if len(timestamps) == 1:
+            first_started.set()
+            await release_first.wait()
+            return PushOutcome.DELIVERED
+        return second_outcome
+
+    with patch(SEND_REMOTE_MEDIA, side_effect=controlled_send):
+        hass.states.async_set(ENTITY_ID, "paused", PLAYING_ATTRIBUTES)
+        first_delivery = asyncio.create_task(
+            _deliver_current_state(hass, webhook_id), name="older_remote_media_delivery"
+        )
+        await first_started.wait()
+
+        hass.states.async_set(ENTITY_ID, "playing", NEXT_TRACK)
+        await _deliver_current_state(hass, webhook_id)
+
+        release_first.set()
+        await first_delivery
+
+    return timestamps
 
 
 @pytest.fixture
@@ -452,13 +506,13 @@ async def test_reload_restores_listener_context_and_delivery(
     assert len(_payloads(aioclient_mock)) == 1
 
 
-async def test_restart_restores_persisted_context_listener_and_delivery(
+async def test_restart_restores_listener_and_reconciles_current_state(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     hass_admin_user: MockUser,
     aioclient_mock: AiohttpClientMocker,
 ) -> None:
-    """Startup restores a RemoteMedia subscription solely from generic storage."""
+    """Startup restores and reconciles without a new entity state event."""
     webhook_id = "restored-remote-media"
     last_snapshot = {
         "server_id": SERVER_ID,
@@ -533,7 +587,7 @@ async def test_restart_restores_persisted_context_listener_and_delivery(
     )
     entry.add_to_hass(hass)
     aioclient_mock.post(PUSH_URL, status=HTTPStatus.CREATED, json={})
-    hass.states.async_set(ENTITY_ID, "playing", PLAYING_ATTRIBUTES)
+    hass.states.async_set(ENTITY_ID, "playing", NEXT_TRACK)
 
     await async_setup_component(hass, DOMAIN, {DOMAIN: {}})
     await hass.async_block_till_done()
@@ -542,10 +596,42 @@ async def test_restart_restores_persisted_context_listener_and_delivery(
     assert restored[PUSH_SUBSCRIPTION_DATA] == context
     assert len(hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][webhook_id]) == 1
 
-    hass.states.async_set(ENTITY_ID, "playing", NEXT_TRACK)
     await _settle(hass)
     [payload] = _payloads(aioclient_mock)
     assert payload["now_playing"]["attributes"]["snapshot"]["title"] == "Second"
+
+
+async def test_older_success_cannot_overwrite_newer_success(
+    hass: HomeAssistant,
+    following: str,
+) -> None:
+    """An older successful request cannot overwrite newer delivered state."""
+    timestamps = await _run_overlapping_deliveries(
+        hass, following, PushOutcome.DELIVERED
+    )
+
+    context = _subscription(hass, following)[PUSH_SUBSCRIPTION_DATA]
+    assert timestamps[1] > timestamps[0]
+    assert context[CONTEXT_LAST_TIMESTAMP] == timestamps[1]
+    assert context[CONTEXT_LAST_SNAPSHOT]["title"] == "Second"
+    assert SESSION_ID in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][following]
+
+
+async def test_older_success_cannot_overwrite_newer_failure(
+    hass: HomeAssistant,
+    following: str,
+) -> None:
+    """An older completion cannot claim stale state after a newer failure."""
+    previous_snapshot = _subscription(hass, following)[PUSH_SUBSCRIPTION_DATA][
+        CONTEXT_LAST_SNAPSHOT
+    ]
+    timestamps = await _run_overlapping_deliveries(hass, following, PushOutcome.FAILED)
+
+    context = _subscription(hass, following)[PUSH_SUBSCRIPTION_DATA]
+    assert timestamps[1] > timestamps[0]
+    assert context[CONTEXT_LAST_TIMESTAMP] == timestamps[1]
+    assert context[CONTEXT_LAST_SNAPSHOT] == previous_snapshot
+    assert SESSION_ID in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][following]
 
 
 async def test_ordering_timestamp_increases_within_one_second(

@@ -446,6 +446,14 @@ async def webhook_update_registration(
 
     hass.config_entries.async_update_entry(config_entry, data=new_registration)
 
+    # A registration may gain push capability after subscriptions were stored.
+    # Reuse the normal restoration path to replace or arm their listeners.
+    from .push_subscription.store import (  # noqa: PLC0415
+        async_restore_push_subscriptions,
+    )
+
+    async_restore_push_subscriptions(hass, config_entry.data[CONF_WEBHOOK_ID])
+
     await hass_notify.async_reload(hass, DOMAIN)
 
     return webhook_response(
