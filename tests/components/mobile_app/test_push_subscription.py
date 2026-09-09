@@ -125,9 +125,11 @@ async def test_register_stores_subscription(
     await _register_subscription(webhook_client, push_webhook_id)
 
     stored = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID]
-    assert stored[PUSH_SUBSCRIPTION_TOKEN] == SUB_TOKEN
-    assert stored[PUSH_SUBSCRIPTION_ENTITY_IDS] == [TRACKED_ENTITY]
-    assert stored[PUSH_SUBSCRIPTION_TARGET] == "lock_screen"
+    assert stored == {
+        PUSH_SUBSCRIPTION_TOKEN: SUB_TOKEN,
+        PUSH_SUBSCRIPTION_ENTITY_IDS: [TRACKED_ENTITY],
+        PUSH_SUBSCRIPTION_TARGET: "lock_screen",
+    }
     assert SUB_ID in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][push_webhook_id]
 
 

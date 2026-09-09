@@ -1,8 +1,8 @@
 """Push-subscription storage, state tracking, and debounce.
 
-A push subscription maps a push token to a set of entity_ids. The integration
-owns the mapping and the state tracking; it has no knowledge of what the app
-does with the resulting push.
+A push subscription maps a push token to a set of entity_ids. Internal callers
+may also persist an opaque delivery kind, context, and debounce interval; the
+public generic registration continues to use the original defaults.
 
 State changes are debounced per subscription: a burst of rapid changes within
 PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS collapses to a single push (trailing edge),
@@ -37,8 +37,11 @@ from ..const import (
     DATA_PUSH_SUBSCRIPTIONS,
     DATA_STORE,
     DOMAIN,
+    PUSH_SUBSCRIPTION_DATA,
+    PUSH_SUBSCRIPTION_DEBOUNCE,
     PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS,
     PUSH_SUBSCRIPTION_ENTITY_IDS,
+    PUSH_SUBSCRIPTION_KIND,
     PUSH_SUBSCRIPTION_MAX_PER_DEVICE,
     PUSH_SUBSCRIPTION_TARGET,
     PUSH_SUBSCRIPTION_TOKEN,
@@ -60,11 +63,13 @@ def _async_cancel_debounce(hass: HomeAssistant, webhook_id: str, sub_id: str) ->
 
 
 @callback
-def _async_schedule_push(hass: HomeAssistant, webhook_id: str, sub_id: str) -> None:
+def async_schedule_subscription_push(
+    hass: HomeAssistant, webhook_id: str, sub_id: str
+) -> None:
     """Schedule a debounced push, resetting any in-flight timer.
 
     Trailing edge: each call restarts the clock, so the push only fires once the
-    subscription has been quiet for PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS.
+    subscription has been quiet for its configured interval.
     """
     # Local import to avoid a circular import at module load.
     from .notify import async_send_subscription_push  # noqa: PLC0415
@@ -83,7 +88,15 @@ def _async_schedule_push(hass: HomeAssistant, webhook_id: str, sub_id: str) -> N
                 del hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_DEBOUNCE][webhook_id]
         async_send_subscription_push(hass, webhook_id, sub_id)
 
-    cancel = async_call_later(hass, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS, _fire)
+    subscription = (
+        hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS].get(webhook_id, {}).get(sub_id)
+    )
+    if subscription is None:
+        return
+    delay = subscription.get(
+        PUSH_SUBSCRIPTION_DEBOUNCE, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS
+    )
+    cancel = async_call_later(hass, delay, _fire)
     hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_DEBOUNCE].setdefault(webhook_id, {})[
         sub_id
     ] = cancel
@@ -122,7 +135,7 @@ def _async_setup_tracker(
         # should refresh the subscribed surface.
         if not hass.is_running:
             return
-        _async_schedule_push(hass, webhook_id, sub_id)
+        async_schedule_subscription_push(hass, webhook_id, sub_id)
 
     unsub = async_track_state_change_event(hass, list(entity_ids), _handle_state_change)
     hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS].setdefault(webhook_id, {})[
@@ -138,6 +151,10 @@ def store_push_subscription(
     token: str,
     entity_ids: list[str],
     target: str | None,
+    *,
+    kind: str | None = None,
+    data: dict[str, object] | None = None,
+    debounce_seconds: float | None = None,
 ) -> None:
     """Persist a subscription and (re)arm its state listener.
 
@@ -158,15 +175,41 @@ def store_push_subscription(
         )
         del device_subs[oldest_sub_id]
         _async_unsub_tracker(hass, webhook_id, oldest_sub_id)
-    device_subs[sub_id] = {
+    subscription: dict[str, object] = {
         PUSH_SUBSCRIPTION_TOKEN: token,
         PUSH_SUBSCRIPTION_ENTITY_IDS: entity_ids,
         PUSH_SUBSCRIPTION_TARGET: target,
     }
+    if kind is not None:
+        subscription[PUSH_SUBSCRIPTION_KIND] = kind
+    if data is not None:
+        subscription[PUSH_SUBSCRIPTION_DATA] = data
+    if debounce_seconds is not None:
+        subscription[PUSH_SUBSCRIPTION_DEBOUNCE] = debounce_seconds
+    device_subs[sub_id] = subscription
     _async_setup_tracker(hass, webhook_id, sub_id, entity_ids)
     hass.data[DOMAIN][DATA_STORE].async_delay_save(
         partial(savable_state, hass), STORAGE_SAVE_DELAY_SECONDS
     )
+
+
+@callback
+def update_push_subscription_data(
+    hass: HomeAssistant,
+    webhook_id: str,
+    sub_id: str,
+    subscription: dict[str, object],
+    data: dict[str, object],
+) -> bool:
+    """Persist opaque data if `subscription` is still the current value."""
+    current = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS].get(webhook_id, {}).get(sub_id)
+    if current is not subscription:
+        return False
+    subscription[PUSH_SUBSCRIPTION_DATA] = data
+    hass.data[DOMAIN][DATA_STORE].async_delay_save(
+        partial(savable_state, hass), STORAGE_SAVE_DELAY_SECONDS
+    )
+    return True
 
 
 @callback

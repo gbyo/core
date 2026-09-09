@@ -24,6 +24,8 @@ from ..const import (
     DATA_PUSH_SUBSCRIPTIONS,
     DOMAIN,
     PUSH_SUBSCRIPTION_ID,
+    PUSH_SUBSCRIPTION_KIND,
+    PUSH_SUBSCRIPTION_KIND_REMOTE_MEDIA,
     PUSH_SUBSCRIPTION_TARGET,
     PUSH_SUBSCRIPTION_TOKEN,
     PUSH_SUBSCRIPTION_TRIGGER,
@@ -48,9 +50,18 @@ def async_send_subscription_push(
     if ATTR_PUSH_URL not in entry.data.get(ATTR_APP_DATA, {}):
         return
 
+    if sub.get(PUSH_SUBSCRIPTION_KIND) == PUSH_SUBSCRIPTION_KIND_REMOTE_MEDIA:
+        # Local import avoids loading RemoteMedia for ordinary subscriptions.
+        from ..remote_media.subscription import (  # noqa: PLC0415
+            async_deliver_subscription,
+        )
+
+        coro = async_deliver_subscription(hass, entry, webhook_id, sub_id, sub)
+    else:
+        coro = _send_subscription_push(hass, entry, sub_id, sub)
+
     hass.async_create_background_task(
-        _send_subscription_push(hass, entry, sub_id, sub),
-        f"mobile_app_push_subscription_{webhook_id}_{sub_id}",
+        coro, f"mobile_app_push_subscription_{webhook_id}_{sub_id}"
     )
 
 

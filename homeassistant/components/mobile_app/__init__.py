@@ -35,6 +35,7 @@ from . import (  # noqa: F401
     binary_sensor as binary_sensor_pre_import,
     device_tracker as device_tracker_pre_import,
     notify as notify_pre_import,
+    remote_media as remote_media_pre_import,
     sensor as sensor_pre_import,
     websocket_api,
 )

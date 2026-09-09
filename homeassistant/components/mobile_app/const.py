@@ -111,6 +111,12 @@ PUSH_SUBSCRIPTION_ENTITY_IDS = "entity_ids"
 # Opaque, app-defined hint echoed back in the push so the app knows which
 # surface to reload. Core treats it as an opaque string.
 PUSH_SUBSCRIPTION_TARGET = "target"
+# Internal delivery metadata. These are persisted but are not accepted by the
+# public register_push_subscription webhook.
+PUSH_SUBSCRIPTION_KIND = "kind"
+PUSH_SUBSCRIPTION_DATA = "data"
+PUSH_SUBSCRIPTION_DEBOUNCE = "debounce_seconds"
+PUSH_SUBSCRIPTION_KIND_REMOTE_MEDIA = "remote_media"
 # Marker in the outgoing push so the push relay formats this as a silent
 # background push rather than a user-visible notification.
 PUSH_SUBSCRIPTION_TRIGGER = "push_subscription"

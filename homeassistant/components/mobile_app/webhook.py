@@ -114,6 +114,8 @@ _LOGGER = logging.getLogger(__name__)
 
 DELAY_SAVE = 10
 
+WEBHOOK_PAYLOAD_REDACTORS: Registry[str, Callable[[Any], Any]] = Registry()
+
 WEBHOOK_COMMANDS: Registry[
     str, Callable[[HomeAssistant, ConfigEntry, Any], Coroutine[Any, Any, Response]]
 ] = Registry()
@@ -245,12 +247,16 @@ async def handle_webhook(
         )
         return empty_okay_response()
 
-    _LOGGER.debug(
-        "Received webhook payload from %s for type %s: %s",
-        device_name,
-        webhook_type,
-        webhook_payload,
-    )
+    if _LOGGER.isEnabledFor(logging.DEBUG):
+        loggable_payload = webhook_payload
+        if (redactor := WEBHOOK_PAYLOAD_REDACTORS.get(webhook_type)) is not None:
+            loggable_payload = redactor(webhook_payload)
+        _LOGGER.debug(
+            "Received webhook payload from %s for type %s: %s",
+            device_name,
+            webhook_type,
+            loggable_payload,
+        )
 
     # Shield so we make sure we finish the webhook, even if sender hangs up.
     return await asyncio.shield(
