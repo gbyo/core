@@ -1,5 +1,6 @@
 """Tests for mobile_app push subscriptions."""
 
+from collections.abc import Generator
 from datetime import timedelta
 from http import HTTPStatus
 from typing import Any
@@ -15,27 +16,40 @@ from homeassistant.components.mobile_app.const import (
     DATA_PUSH_SUBSCRIPTION_UNSUBS,
     DATA_PUSH_SUBSCRIPTIONS,
     DOMAIN,
+    PUSH_SUBSCRIPTION_DATA,
     PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS,
     PUSH_SUBSCRIPTION_ENTITY_IDS,
+    PUSH_SUBSCRIPTION_FOLLOW_RENAMES,
     PUSH_SUBSCRIPTION_ID,
     PUSH_SUBSCRIPTION_MAX_PER_DEVICE,
     PUSH_SUBSCRIPTION_TARGET,
     PUSH_SUBSCRIPTION_TOKEN,
     PUSH_SUBSCRIPTION_TRIGGER,
 )
+from homeassistant.components.mobile_app.push_subscription.delivery import (
+    PUSH_SUBSCRIPTION_DELIVERIES,
+)
 from homeassistant.components.mobile_app.push_subscription.notify import (
     _send_subscription_push,
 )
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.components.mobile_app.push_subscription.store import (
+    async_restore_push_subscriptions,
+    store_push_subscription,
+    update_push_subscription_data,
+)
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_WEBHOOK_ID
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
+from homeassistant.util.json import JsonObjectType
 
-from .const import REGISTER_CLEARTEXT
+from .const import REGISTER_CLEARTEXT, UPDATE
 
 from tests.common import async_fire_time_changed
 
 PUSH_URL = "https://mobile-push.home-assistant.dev/push"
+PUSH_APP_DATA = {"push_url": PUSH_URL, "push_token": "device-token"}
 TRACKED_ENTITY = "light.living_room"
 SUB_ID = "sub-1"
 SUB_TOKEN = "push-token-abc"
@@ -84,10 +98,7 @@ async def push_webhook_id(hass: HomeAssistant, webhook_client: TestClient) -> st
 
     resp = await webhook_client.post(
         "/api/mobile_app/registrations",
-        json={
-            **REGISTER_CLEARTEXT,
-            "app_data": {"push_url": PUSH_URL, "push_token": "device-token"},
-        },
+        json={**REGISTER_CLEARTEXT, "app_data": PUSH_APP_DATA},
     )
     assert resp.status == HTTPStatus.CREATED
     await hass.async_block_till_done()
@@ -118,6 +129,61 @@ async def _register_subscription(
     assert resp.status == HTTPStatus.OK
 
 
+async def _update_registration(
+    client: TestClient, webhook_id: str, app_data: dict[str, Any]
+) -> None:
+    """POST an update_registration webhook command."""
+    response = await client.post(
+        f"/api/webhook/{webhook_id}",
+        json={"type": "update_registration", "data": {**UPDATE, "app_data": app_data}},
+    )
+    assert response.status == HTTPStatus.OK
+
+
+KIND = "test_kind"
+KIND_DEBOUNCE_SECONDS = 0.2
+
+
+def _store_internal(
+    hass: HomeAssistant,
+    webhook_id: str,
+    *,
+    sub_id: str = SUB_ID,
+    entity_ids: list[str] | None = None,
+    kind: str | None = None,
+    data: JsonObjectType | None = None,
+    debounce_seconds: float | None = None,
+    follow_entity_renames: bool = False,
+) -> None:
+    """Store a subscription the way a caller inside the integration does.
+
+    Nothing here is reachable from the public webhook; these are the options an
+    internal consumer of push subscriptions has.
+    """
+    store_push_subscription(
+        hass,
+        webhook_id,
+        sub_id,
+        SUB_TOKEN,
+        entity_ids or [TRACKED_ENTITY],
+        None,
+        kind=kind,
+        data=data,
+        debounce_seconds=debounce_seconds,
+        follow_entity_renames=follow_entity_renames,
+    )
+
+
+async def _settle(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, seconds: float
+) -> None:
+    """Advance past a debounce interval and let any delivery task finish."""
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(seconds=seconds))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
 async def test_register_stores_subscription(
     hass: HomeAssistant, webhook_client: TestClient, push_webhook_id: str
 ) -> None:
@@ -125,9 +191,13 @@ async def test_register_stores_subscription(
     await _register_subscription(webhook_client, push_webhook_id)
 
     stored = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID]
-    assert stored[PUSH_SUBSCRIPTION_TOKEN] == SUB_TOKEN
-    assert stored[PUSH_SUBSCRIPTION_ENTITY_IDS] == [TRACKED_ENTITY]
-    assert stored[PUSH_SUBSCRIPTION_TARGET] == "lock_screen"
+    # Exactly the public shape: a registration from the app carries no delivery
+    # kind, no opaque data and no debounce of its own.
+    assert stored == {
+        PUSH_SUBSCRIPTION_TOKEN: SUB_TOKEN,
+        PUSH_SUBSCRIPTION_ENTITY_IDS: [TRACKED_ENTITY],
+        PUSH_SUBSCRIPTION_TARGET: "lock_screen",
+    }
     assert SUB_ID in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][push_webhook_id]
 
 
@@ -149,6 +219,104 @@ async def test_no_listener_without_push_url(
     # registration can never send a push.
     assert SUB_ID in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][webhook_id]
     assert webhook_id not in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS]
+
+
+async def test_a_pending_push_survives_an_unrelated_update_registration(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    push_webhook_id: str,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """An app version change is not a reason to lose a push the device is owed.
+
+    Re-arming a subscription replaces its listener, and that cancels the debounce timer
+    already counting down for it, so a change the app was about to be told about would
+    simply never arrive.
+    """
+    await _register_subscription(webhook_client, push_webhook_id)
+    freezer.move_to("2026-01-01 00:00:00+00:00")
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        hass.states.async_set(TRACKED_ENTITY, "on")
+        await hass.async_block_till_done()
+        # Mid-debounce, and about something that has nothing to do with pushing.
+        await _update_registration(webhook_client, push_webhook_id, PUSH_APP_DATA)
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    assert mock_send.call_count == 1
+
+
+async def test_gaining_a_push_url_arms_a_stored_subscription(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A subscription registered before there was anywhere to send it starts working."""
+    await async_setup_component(hass, DOMAIN, {DOMAIN: {}})
+    response = await webhook_client.post(
+        "/api/mobile_app/registrations", json=REGISTER_CLEARTEXT
+    )
+    assert response.status == HTTPStatus.CREATED
+    webhook_id = (await response.json())[CONF_WEBHOOK_ID]
+    await hass.async_block_till_done()
+    await _register_subscription(webhook_client, webhook_id)
+    assert webhook_id not in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS]
+    freezer.move_to("2026-01-01 00:00:00+00:00")
+
+    await _update_registration(webhook_client, webhook_id, PUSH_APP_DATA)
+    assert len(hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][webhook_id]) == 1
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        hass.states.async_set(TRACKED_ENTITY, "on")
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    assert mock_send.call_count == 1
+
+
+async def test_losing_a_push_url_stops_listening_but_keeps_the_subscription(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    push_webhook_id: str,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """There is nowhere to deliver any more, but the app should not have to re-register."""
+    await _register_subscription(webhook_client, push_webhook_id)
+    assert len(hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][push_webhook_id]) == 1
+    freezer.move_to("2026-01-01 00:00:00+00:00")
+
+    await _update_registration(webhook_client, push_webhook_id, {"foo": "bar"})
+
+    assert push_webhook_id not in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS]
+    assert push_webhook_id not in hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_DEBOUNCE]
+    # The mapping survives, so a push URL coming back resumes it.
+    assert hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID][
+        PUSH_SUBSCRIPTION_ENTITY_IDS
+    ] == [TRACKED_ENTITY]
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        hass.states.async_set(TRACKED_ENTITY, "on")
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    assert mock_send.call_count == 0
+
+
+async def test_repeated_push_capable_update_registrations_do_not_duplicate_listeners(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    push_webhook_id: str,
+) -> None:
+    """Staying push-capable leaves the subscription's listeners exactly as they are."""
+    await _register_subscription(webhook_client, push_webhook_id)
+    armed = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][push_webhook_id][SUB_ID]
+
+    for _ in range(2):
+        await _update_registration(webhook_client, push_webhook_id, PUSH_APP_DATA)
+        device_unsubs = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][
+            push_webhook_id
+        ]
+        assert len(device_unsubs) == 1
+        # The same listener, not a replacement: nothing was torn down and re-armed.
+        assert device_unsubs[SUB_ID] is armed
 
 
 async def test_register_is_idempotent(
@@ -451,3 +619,262 @@ async def test_send_push_swallows_client_error(
         await _send_subscription_push(hass, entry, SUB_ID, sub)
 
     assert session.post.call_count == 1
+
+
+async def test_a_public_subscription_does_not_follow_an_entity_rename(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    push_webhook_id: str,
+    entity_registry: er.EntityRegistry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A registration named entity_ids and meant them.
+
+    Whether a relationship is with the entity or with the string that names it is the
+    consumer's policy, and the public webhook has no way to say. So a rename leaves the
+    mapping exactly as registered, which is what the app already expects.
+    """
+    entry = entity_registry.async_get_or_create(
+        "light", "test", "lamp-1", suggested_object_id="living_room"
+    )
+    assert entry.entity_id == TRACKED_ENTITY
+    await _register_subscription(webhook_client, push_webhook_id)
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        entity_registry.async_update_entity(
+            TRACKED_ENTITY, new_entity_id="light.lounge"
+        )
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    # Unchanged, and still exactly the shape a public registration has always stored:
+    # opting out is the absence of a key, not a stored false.
+    assert hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID] == {
+        PUSH_SUBSCRIPTION_TOKEN: SUB_TOKEN,
+        PUSH_SUBSCRIPTION_ENTITY_IDS: [TRACKED_ENTITY],
+        PUSH_SUBSCRIPTION_TARGET: "lock_screen",
+    }
+    assert mock_send.call_count == 0
+
+
+async def test_an_opted_in_subscription_moves_onto_the_new_entity_id(
+    hass: HomeAssistant,
+    push_webhook_id: str,
+    entity_registry: er.EntityRegistry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A subscription that is with the entity is moved onto its new identifier.
+
+    Leaving it alone would have it listening for an identifier nothing will ever report
+    again, with no way for the consumer to find out.
+    """
+    entry = entity_registry.async_get_or_create(
+        "light", "test", "lamp-1", suggested_object_id="living_room"
+    )
+    assert entry.entity_id == TRACKED_ENTITY
+    _store_internal(
+        hass,
+        push_webhook_id,
+        entity_ids=[TRACKED_ENTITY, "light.hall"],
+        follow_entity_renames=True,
+    )
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        entity_registry.async_update_entity(
+            TRACKED_ENTITY, new_entity_id="light.lounge"
+        )
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    stored = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID]
+    assert stored[PUSH_SUBSCRIPTION_ENTITY_IDS] == ["light.lounge", "light.hall"]
+    assert stored[PUSH_SUBSCRIPTION_TOKEN] == SUB_TOKEN
+    # Re-arming must not lose what the subscription asked for.
+    assert stored[PUSH_SUBSCRIPTION_FOLLOW_RENAMES] is True
+    # One listener entry for the subscription, and the rename is worth telling it about.
+    assert len(hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][push_webhook_id]) == 1
+    assert mock_send.call_count == 1
+
+    # The state listener moved with it: the old identifier is no longer watched.
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        hass.states.async_set(TRACKED_ENTITY, "on")
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+        assert mock_send.call_count == 0
+
+        hass.states.async_set("light.lounge", "on")
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    assert mock_send.call_count == 1
+
+
+async def test_a_rename_onto_an_already_tracked_entity_id_does_not_duplicate_it(
+    hass: HomeAssistant,
+    push_webhook_id: str,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Two tracked entities collapsing into one must not arm the same listener twice."""
+    entry = entity_registry.async_get_or_create(
+        "light", "test", "lamp-1", suggested_object_id="living_room"
+    )
+    assert entry.entity_id == TRACKED_ENTITY
+    _store_internal(
+        hass,
+        push_webhook_id,
+        entity_ids=[TRACKED_ENTITY, "light.hall"],
+        follow_entity_renames=True,
+    )
+
+    entity_registry.async_update_entity(TRACKED_ENTITY, new_entity_id="light.hall")
+    await hass.async_block_till_done()
+
+    stored = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID]
+    assert stored[PUSH_SUBSCRIPTION_ENTITY_IDS] == ["light.hall"]
+    assert len(hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTION_UNSUBS][push_webhook_id]) == 1
+
+
+async def test_the_rename_opt_in_survives_a_restore(
+    hass: HomeAssistant,
+    push_webhook_id: str,
+    entity_registry: er.EntityRegistry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The opt-in is persisted, so restoring a subscription re-arms what it asked for."""
+    entry = entity_registry.async_get_or_create(
+        "light", "test", "lamp-1", suggested_object_id="living_room"
+    )
+    assert entry.entity_id == TRACKED_ENTITY
+    _store_internal(hass, push_webhook_id, follow_entity_renames=True)
+
+    async_restore_push_subscriptions(hass, push_webhook_id)
+
+    with patch(SEND_PUSH, new_callable=AsyncMock):
+        entity_registry.async_update_entity(
+            TRACKED_ENTITY, new_entity_id="light.lounge"
+        )
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    stored = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID]
+    assert stored[PUSH_SUBSCRIPTION_ENTITY_IDS] == ["light.lounge"]
+    assert stored[PUSH_SUBSCRIPTION_FOLLOW_RENAMES] is True
+
+
+@pytest.fixture
+def deliveries() -> Generator[list[tuple[str, str, dict[str, Any]]]]:
+    """Register a delivery kind for the duration of one test."""
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _deliver(
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        webhook_id: str,
+        sub_id: str,
+        subscription: dict[str, Any],
+    ) -> None:
+        calls.append((webhook_id, sub_id, subscription))
+
+    PUSH_SUBSCRIPTION_DELIVERIES[KIND] = _deliver
+    yield calls
+    del PUSH_SUBSCRIPTION_DELIVERIES[KIND]
+
+
+async def test_a_kind_is_delivered_by_its_own_registered_implementation(
+    hass: HomeAssistant,
+    push_webhook_id: str,
+    deliveries: list[tuple[str, str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A subscription with a kind is handed to that kind, not pushed generically."""
+    _store_internal(hass, push_webhook_id, kind=KIND, data={"seen": 1})
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        hass.states.async_set(TRACKED_ENTITY, "on")
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    assert mock_send.call_count == 0
+    assert deliveries == [
+        (
+            push_webhook_id,
+            SUB_ID,
+            hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID],
+        )
+    ]
+
+
+async def test_an_unregistered_kind_is_dropped_rather_than_pushed_generically(
+    hass: HomeAssistant,
+    push_webhook_id: str,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Nothing knows how to build this payload, and the generic push is not it."""
+    _store_internal(hass, push_webhook_id, kind="kind_nothing_registered")
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        hass.states.async_set(TRACKED_ENTITY, "on")
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    assert mock_send.call_count == 0
+
+
+async def test_a_kind_may_coalesce_on_a_shorter_interval_of_its_own(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    push_webhook_id: str,
+    deliveries: list[tuple[str, str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A kind's interval is its own; the generic default is untouched by it."""
+    await _register_subscription(webhook_client, push_webhook_id, sub_id="generic")
+    _store_internal(
+        hass, push_webhook_id, kind=KIND, debounce_seconds=KIND_DEBOUNCE_SECONDS
+    )
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        hass.states.async_set(TRACKED_ENTITY, "on")
+        await _settle(hass, freezer, KIND_DEBOUNCE_SECONDS + 0.1)
+        assert len(deliveries) == 1
+        assert mock_send.call_count == 0
+
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS)
+
+    assert len(deliveries) == 1
+    assert mock_send.call_count == 1
+
+
+async def test_restoring_a_kind_reconciles_what_the_device_was_last_sent(
+    hass: HomeAssistant,
+    webhook_client: TestClient,
+    push_webhook_id: str,
+    deliveries: list[tuple[str, str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A kind sends state, so restoring one asks it to bring the device up to date.
+
+    A generic subscription carries no state and stays quiet until something changes.
+    """
+    await _register_subscription(webhook_client, push_webhook_id, sub_id="generic")
+    _store_internal(hass, push_webhook_id, kind=KIND)
+
+    with patch(SEND_PUSH, new_callable=AsyncMock) as mock_send:
+        async_restore_push_subscriptions(hass, push_webhook_id)
+        await _settle(hass, freezer, PUSH_SUBSCRIPTION_DEBOUNCE_SECONDS + 1)
+
+    assert len(deliveries) == 1
+    assert mock_send.call_count == 0
+
+
+async def test_opaque_data_is_not_written_back_to_a_replaced_subscription(
+    hass: HomeAssistant,
+    push_webhook_id: str,
+) -> None:
+    """Delivery is asynchronous, so what it started from may no longer be stored."""
+    _store_internal(hass, push_webhook_id, kind=KIND, data={"seen": 1})
+    started_from = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID]
+
+    assert update_push_subscription_data(
+        hass, push_webhook_id, SUB_ID, started_from, {"seen": 2}
+    )
+    _store_internal(hass, push_webhook_id, kind=KIND, data={"seen": 3})
+
+    assert not update_push_subscription_data(
+        hass, push_webhook_id, SUB_ID, started_from, {"seen": 4}
+    )
+    stored = hass.data[DOMAIN][DATA_PUSH_SUBSCRIPTIONS][push_webhook_id][SUB_ID]
+    assert stored[PUSH_SUBSCRIPTION_DATA] == {"seen": 3}

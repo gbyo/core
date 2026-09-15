@@ -24,10 +24,12 @@ from ..const import (
     DATA_PUSH_SUBSCRIPTIONS,
     DOMAIN,
     PUSH_SUBSCRIPTION_ID,
+    PUSH_SUBSCRIPTION_KIND,
     PUSH_SUBSCRIPTION_TARGET,
     PUSH_SUBSCRIPTION_TOKEN,
     PUSH_SUBSCRIPTION_TRIGGER,
 )
+from .delivery import PUSH_SUBSCRIPTION_DELIVERIES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,9 +50,21 @@ def async_send_subscription_push(
     if ATTR_PUSH_URL not in entry.data.get(ATTR_APP_DATA, {}):
         return
 
+    if (kind := sub.get(PUSH_SUBSCRIPTION_KIND)) is None:
+        coro = _send_subscription_push(hass, entry, sub_id, sub)
+    elif (deliver := PUSH_SUBSCRIPTION_DELIVERIES.get(kind)) is not None:
+        coro = deliver(hass, entry, webhook_id, sub_id, sub)
+    else:
+        # The module that owns this kind is not loaded, so nothing knows how to
+        # build its payload. Sending the generic trigger instead would tell a
+        # surface expecting state that something changed and nothing more.
+        _LOGGER.debug(
+            "No delivery registered for %s push subscription %s", kind, sub_id
+        )
+        return
+
     hass.async_create_background_task(
-        _send_subscription_push(hass, entry, sub_id, sub),
-        f"mobile_app_push_subscription_{webhook_id}_{sub_id}",
+        coro, f"mobile_app_push_subscription_{webhook_id}_{sub_id}"
     )
 
 

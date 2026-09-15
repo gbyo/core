@@ -8,6 +8,7 @@ to the app's push URL whenever any of those entities change state.
 from . import webhook  # noqa: F401
 from .store import (
     async_restore_push_subscriptions,
+    async_schedule_subscription_push,
     async_teardown_device_subscriptions,
     remove_push_subscription,
     remove_stored_device_subscriptions,
@@ -16,6 +17,7 @@ from .store import (
 
 __all__ = [
     "async_restore_push_subscriptions",
+    "async_schedule_subscription_push",
     "async_teardown_device_subscriptions",
     "remove_push_subscription",
     "remove_stored_device_subscriptions",

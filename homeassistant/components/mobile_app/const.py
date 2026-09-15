@@ -111,6 +111,16 @@ PUSH_SUBSCRIPTION_ENTITY_IDS = "entity_ids"
 # Opaque, app-defined hint echoed back in the push so the app knows which
 # surface to reload. Core treats it as an opaque string.
 PUSH_SUBSCRIPTION_TARGET = "target"
+# Internal delivery metadata. These are persisted with a subscription but are
+# not accepted by the public register_push_subscription webhook: they belong to
+# whichever part of this integration created the subscription, not to the app.
+PUSH_SUBSCRIPTION_KIND = "kind"
+PUSH_SUBSCRIPTION_DATA = "data"
+PUSH_SUBSCRIPTION_DEBOUNCE = "debounce_seconds"
+# Whether this subscription is with the entity rather than with the entity_id
+# that names it. Persisted only when true, so a subscription that never asked
+# for it keeps the stored shape it has always had and needs no migration.
+PUSH_SUBSCRIPTION_FOLLOW_RENAMES = "follow_entity_renames"
 # Marker in the outgoing push so the push relay formats this as a silent
 # background push rather than a user-visible notification.
 PUSH_SUBSCRIPTION_TRIGGER = "push_subscription"

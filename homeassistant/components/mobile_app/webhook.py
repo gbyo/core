@@ -61,6 +61,7 @@ from .const import (
     ATTR_EVENT_TYPE,
     ATTR_NO_LEGACY_ENCRYPTION,
     ATTR_OS_VERSION,
+    ATTR_PUSH_URL,
     ATTR_SENSOR_ATTRIBUTES,
     ATTR_SENSOR_DEVICE_CLASS,
     ATTR_SENSOR_DISABLED,
@@ -425,6 +426,7 @@ async def webhook_update_registration(
     hass: HomeAssistant, config_entry: ConfigEntry, data: dict[str, Any]
 ) -> Response:
     """Handle an update registration webhook."""
+    could_push = ATTR_PUSH_URL in config_entry.data.get(ATTR_APP_DATA, {})
     new_registration = {**config_entry.data, **data}
 
     device_registry = dr.async_get(hass)
@@ -439,6 +441,30 @@ async def webhook_update_registration(
     )
 
     hass.config_entries.async_update_entry(config_entry, data=new_registration)
+
+    # Push subscriptions are only touched when this registration's ability to
+    # send a push actually changed. Re-arming them on an ordinary metadata
+    # update would replace their listeners, and replacing a listener cancels the
+    # subscription's pending debounce timer - losing a push the device was
+    # already owed. Imported here because the push_subscription package imports
+    # this module.
+    can_push = ATTR_PUSH_URL in new_registration.get(ATTR_APP_DATA, {})
+    if can_push is not could_push:
+        from .push_subscription.store import (  # noqa: PLC0415
+            async_restore_push_subscriptions,
+            async_teardown_device_subscriptions,
+        )
+
+        webhook_id = config_entry.data[CONF_WEBHOOK_ID]
+        if can_push:
+            # Stored subscriptions registered before there was anywhere to send
+            # them have no listeners at all; this is what arms them.
+            async_restore_push_subscriptions(hass, webhook_id)
+        else:
+            # Nothing can be delivered any more, so stop listening. The stored
+            # mapping stays: the registration may get a push URL back, and the
+            # app should not have to re-register to be followed again.
+            async_teardown_device_subscriptions(hass, webhook_id)
 
     await hass_notify.async_reload(hass, DOMAIN)
 
